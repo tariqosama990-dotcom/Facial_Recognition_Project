@@ -41,3 +41,5 @@ while True:
 # Release the camera and close all windows
 camera.release()
 cv2.destroyAllWindows()
+print("ggggg")
+print("ggggg")
