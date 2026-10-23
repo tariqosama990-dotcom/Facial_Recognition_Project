@@ -1,113 +1,111 @@
-import cv2
 import numpy as np
+import cv2
 from sklearn.datasets import fetch_lfw_people
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from scipy.spatial.distance import cosine
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, classification_report)
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.preprocessing import Normalizer
 from keras_facenet import FaceNet
 
 # ==========================================
-# 1. تهيئة نموذج FaceNet (العقل المدبر)
+# 1. تحميل نموذج FaceNet
 # ==========================================
 print("Loading FaceNet model...")
 embedder = FaceNet()
-print("Model loaded successfully.")
-
-def recognize_face(live_vector, db, threshold=0.75):
-    """
-    دالة المقارنة: تحسب المسافة (Cosine Distance) بين الصورة الحالية والوجوه في الذاكرة
-    """
-    min_dist = float('inf')
-    identity = "Unknown"
-    for name, saved_vector in db.items():
-        dist = cosine(live_vector, saved_vector)
-        if dist < min_dist:
-            min_dist = dist
-            identity = name
-    
-    # إذا كانت المسافة أكبر من حد السماحية، يتم رفض الوصول
-    if min_dist > threshold:
-        identity = "Unknown"
-    
-    return identity, min_dist
 
 # ==========================================
-# 2. تحميل قاعدة البيانات القياسية (LFW)
+# 2. تحميل LFW بدون قص وبحجم كامل
 # ==========================================
-print("\nDownloading / Loading LFW Dataset...")
-print("This might take a moment if it's the first time...")
-# نحضر فقط الأشخاص الذين لديهم 20 صورة على الأقل لضمان اختبار دقيق
-lfw_dataset = fetch_lfw_people(min_faces_per_person=20, color=True, resize=1.0)
-
-images = lfw_dataset.images
-target_labels = lfw_dataset.target
-target_names = lfw_dataset.target_names
-
-print(f"Total images loaded: {len(images)}")
-print(f"Total individuals included: {len(target_names)}")
-
-# ==========================================
-# 3. تقسيم البيانات: 5 صور للذاكرة لإنشاء "متوسط البصمة" وباقي الصور للاختبار
-# ==========================================
-print("\nExtracting Features and Splitting Data (5 for Memory, rest for Testing)...")
-known_embeddings = {}
-test_images = []
-y_true = []
-
-# قاموس مؤقت لجمع أول 5 بصمات لكل شخص
-person_references = {}
-
-for i, (img, label_idx) in enumerate(zip(images, target_labels)):
-    name = target_names[label_idx]
-    
-    # تحويل الصورة إلى الحجم المناسب لنموذج FaceNet
-    resized_face = cv2.resize(img, (160, 160))
-    face_batch = np.expand_dims(resized_face, axis=0)
-    
-    # استخراج بصمة الوجه (Embedding)
-    embedding = embedder.embeddings(face_batch)[0]
-
-    if name not in person_references:
-        person_references[name] = []
-        
-    # أخذ أول 5 صور لتكوين الذاكرة المرجعية
-    if len(person_references[name]) < 5:
-        person_references[name].append(embedding)
-    else:
-        # باقي الصور نستخدمها لاختبار دقة النظام
-        test_images.append(embedding)
-        y_true.append(name)
-        
-    if (i + 1) % 100 == 0:
-        print(f"Processed {i + 1} / {len(images)} images...")
-
-# حساب "المتوسط الحسابي" لبصمات الوجوه الخمسة لإنشاء بصمة مرجعية دقيقة جداً
-for name, embeddings_list in person_references.items():
-    known_embeddings[name] = np.mean(embeddings_list, axis=0)
+print("Loading LFW dataset...")
+lfw = fetch_lfw_people(
+    min_faces_per_person=20,
+    color=True,
+    resize=1.0,
+    slice_=(slice(0, 250), slice(0, 250)),   # الصورة كاملة بدون قص ضيق
+    funneled=True
+)
+images = lfw.images
+labels = lfw.target
+names = lfw.target_names
+print(f"Images: {len(images)} | People: {len(names)}")
 
 # ==========================================
-# 4. التقييم (Evaluation & Metrics)
+# 3. تجهيز الصور بالشكل الصحيح + استخراج البصمات
 # ==========================================
-print("\nRunning Model Evaluation...")
-y_pred = []
- 
-for test_embedding in test_images:
-    # مقارنة كل صورة اختبار بالذاكرة المرجعية
-    identity, dist = recognize_face(test_embedding, known_embeddings, threshold=0.75)
-    y_pred.append(identity)
+def prepare(img):
+    # تحويل إلى uint8 بقيم 0-255 (إذا كانت القيم بين 0 و1 نضربها)
+    if img.max() <= 1.0:
+        img = img * 255.0
+    img = img.astype("uint8")
+    # قص مركزي للوجه ثم تغيير الحجم
+    h, w = img.shape[:2]
+    c = int(min(h, w) * 0.65)
+    y0, x0 = (h - c) // 2, (w - c) // 2
+    face = img[y0:y0 + c, x0:x0 + c]
+    return cv2.resize(face, (160, 160))
 
-# حساب المقاييس
-# يتم استخدام average='weighted' لحساب المتوسط بدقة في حالات التصنيف المتعددة (Multi-class)
-acc = accuracy_score(y_true, y_pred)
-prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+print("Extracting embeddings (batch mode)...")
+faces = np.array([prepare(im) for im in images])
 
-# طباعة النتائج النهائية
-print("\n" + "="*45)        
-print(" 📊 System Evaluation Results (LFW Dataset) ")
-print("="*45)
-print(f"Accuracy  (Overall accuracy):    {acc * 100:.2f}%")
-print(f"Precision (Positive precision):   {prec * 100:.2f}%")
-print(f"Recall    (Recovery rate):    {rec * 100:.2f}%")
-print(f"F1-Score  (The integrated scale):    {f1 * 100:.2f}%")
-print("="*45)
+BATCH = 64
+embeddings = []
+for i in range(0, len(faces), BATCH):
+    batch = faces[i:i + BATCH]
+    # embeddings() على دفعة كاملة؛ نستخدم النموذج مباشرة لتجنب اكتشاف الوجه
+    emb = embedder.embeddings(batch)
+    embeddings.append(emb)
+    print(f"Processed {min(i + BATCH, len(faces))} / {len(faces)}")
+
+X = np.vstack(embeddings)
+
+# ==========================================
+# 4. تقسيم متوازن (stratify) للتدريب والاختبار
+# ==========================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, labels, test_size=0.25, random_state=42, stratify=labels
+)
+
+# ==========================================
+# 5. التسوية L2
+# ==========================================
+norm = Normalizer(norm="l2")
+X_train = norm.transform(X_train)
+X_test = norm.transform(X_test)
+
+# ==========================================
+# 6. التدريب مع البحث عن أفضل المعاملات
+# ==========================================
+print("\nTraining with GridSearch...")
+param_grid = {
+    "C": [0.1, 1, 10, 100],
+    "kernel": ["linear", "rbf"],
+    "gamma": ["scale"],
+}
+grid = GridSearchCV(
+    SVC(probability=True, class_weight="balanced"),
+    param_grid, cv=3, n_jobs=-1, verbose=1
+)
+grid.fit(X_train, y_train)
+classifier = grid.best_estimator_
+print("Best params:", grid.best_params_)
+
+# ==========================================
+# 7. التقييم
+# ==========================================
+y_pred = classifier.predict(X_test)
+
+acc = accuracy_score(y_test, y_pred)
+prec = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+rec = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+
+print("\n" + "=" * 45)
+print(" System Evaluation Results (LFW Dataset) ")
+print("=" * 45)
+print(f"Accuracy : {acc * 100:.2f}%")
+print(f"Precision: {prec * 100:.2f}%")
+print(f"Recall   : {rec * 100:.2f}%")
+print(f"F1-Score : {f1 * 100:.2f}%")
+print("=" * 45)
+print(classification_report(y_test, y_pred, target_names=names, zero_division=0))
