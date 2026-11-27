@@ -1,0 +1,274 @@
+"""
+evaluate.py - يقيس النظام بنفس pipeline التطبيق (detector -> crop -> embedder -> matcher).
+
+الاستخدام:
+    python evaluate.py --data eval_data
+    python evaluate.py --data eval_data --no-detect     (إذا كانت الصور مقصوصة مسبقًا)
+
+هيكل البيانات:
+    eval_data/
+        ali/   1.jpg 2.jpg ...
+        sara/  1.jpg 2.jpg ...
+"""
+import argparse
+import hashlib
+import os
+import random
+from collections import Counter
+
+import cv2
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cosine
+from sklearn.metrics import accuracy_score, classification_report, roc_curve, auc
+
+from matcher import DEFAULT_THRESHOLD, FaceMatcher, make_template
+
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def load_embeddings(root, detector, embedder, detect=True):
+    """dict: اسم -> قائمة بصمات. نفس مسار التطبيق: detect -> crop -> embed"""
+    data, skipped = {}, 0
+    seen_images = {}
+    duplicates = 0
+    for person in sorted(os.listdir(root)):
+        folder = os.path.join(root, person)
+        if not os.path.isdir(folder):
+            continue
+        embs = []
+        for fn in sorted(os.listdir(folder)):
+            if not fn.lower().endswith(IMG_EXT):
+                continue
+            img = cv2.imread(os.path.join(folder, fn))
+            if img is None:
+                skipped += 1
+                continue
+            # Hash decoded pixels so copies with different filenames are detected.
+            digest = (img.shape, hashlib.sha256(img.tobytes()).digest())
+            previous_person = seen_images.get(digest)
+            if previous_person is not None:
+                if previous_person != person:
+                    raise SystemExit(
+                        f"Identical image under two identities: {previous_person!r} "
+                        f"and {person!r} ({fn}). Correct the dataset and try again."
+                    )
+                duplicates += 1
+                continue
+            seen_images[digest] = person
+
+            if detect:
+                box = detector.detect_largest(img)  # أكبر وجه
+                if box is None:
+                    skipped += 1
+                    continue
+                emb = embedder.embed_from_frame(img, box)
+                if emb is None:
+                    skipped += 1
+                    continue
+                embs.append(emb)
+            else:
+                embs.append(embedder.embed(img))
+        if embs:
+            data[person] = embs
+        print(f"  {person}: {len(embs)} images")
+    print(f"Skipped {skipped} images (no face detected or unreadable file)")
+    print(f"Skipped {duplicates} identical duplicate images")
+    return data
+
+
+def split_person(embs, rng):
+    """80% تدريب / 10% تحقق / 10% اختبار"""
+    idx = list(range(len(embs)))
+    rng.shuffle(idx)
+    n = len(idx)
+    n_val = max(1, round(n * 0.1))
+    n_test = max(1, round(n * 0.1))
+    train = [embs[i] for i in idx[: n - n_val - n_test]]
+    val = [embs[i] for i in idx[n - n_val - n_test: n - n_test]]
+    test = [embs[i] for i in idx[n - n_test:]]
+    return train, val, test
+
+
+def run_identification(probes, db, threshold):
+    """نفس FaceMatcher المستخدم في التطبيق"""
+    matcher = FaceMatcher(threshold=threshold)
+    y_true, y_pred = [], []
+    for label, emb in probes:
+        identity, _ = matcher.recognize(emb, db)
+        y_true.append(label)
+        y_pred.append(identity)
+    return y_true, y_pred
+
+
+def verification_scores(probes, db):
+    """كل probe مقابل كل شخص مسجّل: label=1 إذا نفس الشخص"""
+    dists, labels = [], []
+    for label, emb in probes:
+        for name, tmpl in db.items():
+            dists.append(cosine(emb, tmpl))
+            labels.append(1 if label == name else 0)
+    return np.array(dists), np.array(labels)
+
+
+def find_eer(dists, labels):
+    fpr, tpr, thr = roc_curve(labels, -dists)  # مسافة أقل = تشابه أعلى
+    fnr = 1 - tpr
+    i = int(np.argmin(np.abs(fnr - fpr)))
+    return (fpr[i] + fnr[i]) / 2, -thr[i], fpr, tpr
+
+
+def summarize(y_true, y_pred):
+    """FAR: غرباء قُبلوا | FRR: مسجّلون رُفضوا أو عُرِّفوا خطأً (نسب على مستوى الصورة)"""
+    unk = [p for t, p in zip(y_true, y_pred) if t == "Unknown"]
+    enr = [(t, p) for t, p in zip(y_true, y_pred) if t != "Unknown"]
+    far = sum(p != "Unknown" for p in unk) / max(1, len(unk))
+    frr = sum(p != t for t, p in enr) / max(1, len(enr))
+    return far, frr
+
+
+def sweep_thresholds(probes, db, thresholds):
+    rows = []
+    for thr in thresholds:
+        y_true, y_pred = run_identification(probes, db, thr)
+        far, frr = summarize(y_true, y_pred)
+        rows.append((float(thr), accuracy_score(y_true, y_pred), far, frr))
+    return rows
+
+
+def pick_threshold(rows):
+    """يقلل (FAR + FRR) على مجموعة التحقق؛ عند التعادل يأخذ وسط المجال."""
+    best = min(far + frr for _, _, far, frr in rows)
+    cands = [thr for thr, _, far, frr in rows if far + frr <= best + 1e-9]
+    return round(float(np.median(cands)), 3)
+
+
+def report(title, y_true, y_pred, names):
+    print(f"\n===== {title} =====")
+    print(f"Overall Accuracy: {accuracy_score(y_true, y_pred):.4f}")
+    far, frr = summarize(y_true, y_pred)
+    print(f"FAR (strangers accepted): {far:.4f} | FRR (enrolled rejected/misidentified): {frr:.4f}")
+    wrong = Counter(p for t, p in zip(y_true, y_pred) if t == "Unknown" and p != "Unknown")
+    if wrong:
+        print("Strangers accepted as:", dict(wrong.most_common(5)))
+    print(classification_report(
+        y_true, y_pred, labels=names + ["Unknown"], zero_division=0))
+
+
+def build_splits(data, unknown_ratio, rng):
+    """يرجع (enrolled, unknown_people, db, val_probes, test_probes)"""
+    people = sorted(data)
+    n_unknown = max(1, round(len(people) * unknown_ratio))
+    unknown_people = rng.sample(people, n_unknown)
+    enrolled = [p for p in people if p not in unknown_people]
+
+    db, val_probes, test_probes = {}, [], []
+    for p in enrolled:
+        tr, va, te = split_person(data[p], rng)
+        db[p] = make_template(tr)
+        val_probes += [(p, e) for e in va]
+        test_probes += [(p, e) for e in te]
+    # أشخاص غير مسجّلين: نصف صورهم للتحقق ونصفها للاختبار
+    for p in unknown_people:
+        embs = data[p][:]
+        rng.shuffle(embs)
+        half = len(embs) // 2
+        val_probes += [("Unknown", e) for e in embs[:half]]
+        test_probes += [("Unknown", e) for e in embs[half:]]
+    return enrolled, unknown_people, db, val_probes, test_probes
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="eval_data")
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="العتبة الافتراضية للتطبيق")
+    ap.add_argument("--unknown-ratio", type=float, default=0.2,
+                    help="نسبة الأشخاص غير المسجّلين (لاختبار Unknown)")
+    ap.add_argument("--no-detect", action="store_true", help="الصور مقصوصة مسبقًا")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--runs", type=int, default=1,
+                    help="عدد التقسيمات العشوائية (seeds) لحساب المتوسط والانحراف المعياري")
+    ap.add_argument("--max-per-person", type=int, default=None,
+                    help="سقف عدد صور كل شخص لتقليل عدم التوازن (مثلاً 530 صورة لشخص واحد في LFW)")
+    args = ap.parse_args()
+
+    # استيراد متأخر حتى لا يُحمَّل TensorFlow إلا عند التشغيل الفعلي
+    from detector import FaceDetector
+    from embedder import FaceEmbedder
+
+    rng = random.Random(args.seed)
+    detector, embedder = FaceDetector(), FaceEmbedder()
+
+    print("Extracting embeddings:")
+    data = load_embeddings(args.data, detector, embedder, detect=not args.no_detect)
+    data = {k: v for k, v in data.items() if len(v) >= 5}
+    if args.max_per_person:
+        data = {k: (rng.sample(v, args.max_per_person) if len(v) > args.max_per_person else v)
+                for k, v in data.items()}
+    if len(data) < 3:
+        raise SystemExit("Need at least 3 people with 5+ usable images each.")
+
+    enrolled, unknown_people, db, val_probes, test_probes = build_splits(
+        data, args.unknown_ratio, rng)
+    print(f"\nEnrolled: {len(enrolled)} people | Unknown: {len(unknown_people)} people")
+    print(f"Validation probes: {len(val_probes)} | Test probes: {len(test_probes)}")
+
+    # ضبط الـ threshold على مجموعة التحقق فقط (بنفس FaceMatcher، لا على مستوى الأزواج)
+    thresholds = np.round(np.arange(0.20, 0.701, 0.01), 2)
+    rows = sweep_thresholds(val_probes, db, thresholds)
+    tuned = pick_threshold(rows)
+    print("\n[Validation] threshold sweep")
+    for thr, acc, far, frr in rows[::5]:
+        print(f"  thr={thr:.2f}  acc={acc:.3f}  FAR={far:.3f}  FRR={frr:.3f}")
+    print(f"[Validation] chosen threshold = {tuned:.3f} (minimizes FAR + FRR)")
+
+    d_val, l_val = verification_scores(val_probes, db)
+    eer, eer_thr, _, _ = find_eer(d_val, l_val)
+    print(f"[Validation] pair-level EER = {eer:.4f} at {eer_thr:.3f} (reference only)")
+
+    # النتائج النهائية على مجموعة الاختبار
+    for title, thr in [(f"Test @ current threshold ({args.threshold})", args.threshold),
+                       (f"Test @ tuned threshold ({tuned:.3f})", tuned)]:
+        y_true, y_pred = run_identification(test_probes, db, thr)
+        report(title, y_true, y_pred, enrolled)
+
+    # ROC على مجموعة الاختبار
+    d_te, l_te = verification_scores(test_probes, db)
+    if len(set(l_te.tolist())) < 2:
+        raise SystemExit("Test set has only one class; cannot compute ROC. Use more data.")
+    eer_te, _, fpr, tpr = find_eer(d_te, l_te)
+    print(f"[Test] EER = {eer_te:.4f} | AUC = {auc(fpr, tpr):.4f}")
+
+    plt.figure(figsize=(5, 5))
+    plt.plot(fpr, tpr, label=f"AUC = {auc(fpr, tpr):.3f}")
+    plt.plot([0, 1], [0, 1], "--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC (EER = {eer_te:.3f})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("roc.png", dpi=150)
+    print("ROC curve saved to roc.png")
+
+    # تكرار التجربة بتقسيمات مختلفة: تقسيم واحد قد يكون محظوظًا أو سيئًا
+    if args.runs > 1:
+        accs, fars, frrs, eers = [], [], [], []
+        for k in range(args.runs):
+            r = random.Random(args.seed + k)
+            en, _, db_k, val_k, test_k = build_splits(data, args.unknown_ratio, r)
+            thr_k = pick_threshold(sweep_thresholds(val_k, db_k, thresholds))
+            yt, yp = run_identification(test_k, db_k, thr_k)
+            far_k, frr_k = summarize(yt, yp)
+            d_k, l_k = verification_scores(test_k, db_k)
+            eer_k = find_eer(d_k, l_k)[0] if len(set(l_k.tolist())) == 2 else float("nan")
+            accs.append(accuracy_score(yt, yp)); fars.append(far_k)
+            frrs.append(frr_k); eers.append(eer_k)
+        print(f"\n===== {args.runs} runs @ tuned threshold (mean +- std) =====")
+        for label, vals in [("Accuracy", accs), ("FAR", fars), ("FRR", frrs), ("EER", eers)]:
+            print(f"{label}: {np.nanmean(vals):.4f} +- {np.nanstd(vals):.4f}")
+
+
+if __name__ == "__main__":
+    main()
